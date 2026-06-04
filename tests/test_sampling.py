@@ -7,7 +7,11 @@ from triton_csprng import (
     discrete_gaussian,
     stochastic_round,
 )
-from triton_csprng.sampling import _half_plane_cdt_threshold_words
+from triton_csprng.sampling import (
+    _half_plane_cdt_threshold_words,
+    bounded_uint64_two_streams,
+    discrete_gaussian_two_streams,
+)
 
 
 def _bounded_multiply_high_cpu(words, bounds):
@@ -49,6 +53,35 @@ def test_bounded_uint64_matches_multiply_high_mapping():
         key=list(range(8)), nonce=[11, 12], device="cuda:0"
     )
     got = bounded_uint64(rng_sample, bounds, (len(bounds),)).cpu()
+    assert torch.equal(got, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_bounded_uint64_two_streams_matches_separate_streams():
+    bounds = [3, 17, 5, 257]
+    first_expected = ChaCha20Rng(
+        key=list(range(8)), nonce=[21, 22], device="cuda:0"
+    )
+    second_expected = ChaCha20Rng(
+        key=list(range(8)), nonce=[23, 24], device="cuda:0"
+    )
+    expected = torch.cat(
+        [
+            bounded_uint64(first_expected, bounds[:2], (2, 64)),
+            bounded_uint64(second_expected, bounds[2:], (2, 64)),
+        ],
+        dim=0,
+    )
+
+    first = ChaCha20Rng(key=list(range(8)), nonce=[21, 22], device="cuda:0")
+    second = ChaCha20Rng(key=list(range(8)), nonce=[23, 24], device="cuda:0")
+    got = bounded_uint64_two_streams(
+        first,
+        second,
+        bounds,
+        (4, 64),
+        first_channels=2,
+    )
     assert torch.equal(got, expected)
 
 
@@ -100,6 +133,33 @@ def test_discrete_gaussian_symmetry_and_tail_bucket():
     nonzero = positive + negative
     assert nonzero > 0
     assert abs(positive - negative) / nonzero < 0.03
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_discrete_gaussian_two_streams_matches_separate_streams():
+    first_expected = ChaCha20Rng(
+        key=list(range(8)), nonce=[31, 32], device="cuda:0"
+    )
+    second_expected = ChaCha20Rng(
+        key=list(range(8)), nonce=[33, 34], device="cuda:0"
+    )
+    expected = torch.cat(
+        [
+            discrete_gaussian(first_expected, (2, 64)),
+            discrete_gaussian(second_expected, (3, 64)),
+        ],
+        dim=0,
+    )
+
+    first = ChaCha20Rng(key=list(range(8)), nonce=[31, 32], device="cuda:0")
+    second = ChaCha20Rng(key=list(range(8)), nonce=[33, 34], device="cuda:0")
+    got = discrete_gaussian_two_streams(
+        first,
+        second,
+        (5, 64),
+        first_channels=2,
+    )
+    assert torch.equal(got, expected)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

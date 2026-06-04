@@ -5,7 +5,12 @@ from typing import Any
 
 import torch
 
-from .sampling import bounded_uint64, discrete_gaussian
+from .sampling import (
+    bounded_uint64,
+    bounded_uint64_two_streams,
+    discrete_gaussian,
+    discrete_gaussian_two_streams,
+)
 from .stream import ChaCha20Rng
 
 
@@ -145,6 +150,17 @@ class RnsRandomStreams:
                 raise ValueError("repeated_channels cannot exceed bound count")
             parts = []
             non_repeat_count = bounds_t.numel() - repeats
+            if non_repeat_count > 0 and repeats > 0:
+                outputs.append(
+                    bounded_uint64_two_streams(
+                        stream,
+                        self._repeat_streams[idx],
+                        bounds_t,
+                        (bounds_t.numel(), self.num_coeffs),
+                        first_channels=non_repeat_count,
+                    )
+                )
+                continue
             if non_repeat_count > 0:
                 non_repeat_bounds = bounds_t[:non_repeat_count]
                 parts.append(
@@ -192,6 +208,17 @@ class RnsRandomStreams:
         )
         outputs = []
         for idx, count in enumerate(counts):
+            if count > 0 and repeats > 0:
+                outputs.append(
+                    discrete_gaussian_two_streams(
+                        self._device_streams[idx],
+                        self._repeat_streams[idx],
+                        (count + repeats, self.num_coeffs),
+                        first_channels=count,
+                        sigma=sigma,
+                    )
+                )
+                continue
             parts = []
             if count > 0:
                 parts.append(
