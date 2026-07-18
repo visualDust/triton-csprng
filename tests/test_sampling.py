@@ -8,6 +8,8 @@ from triton_csprng import (
     stochastic_round,
 )
 from triton_csprng.sampling import (
+    _cached_bounds_tensor,
+    _device_cdt_thresholds,
     _half_plane_cdt_threshold_words,
     bounded_uint64_two_streams,
     discrete_gaussian_two_streams,
@@ -57,6 +59,108 @@ def test_bounded_uint64_matches_multiply_high_mapping():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_seeded_fused_sampling_regression_and_counter_advancement():
+    """Optimized fused paths must retain the exact pre-optimization stream."""
+
+    key = list(range(8))
+    nonce = [101, 202]
+
+    bounded_rng = ChaCha20Rng(key=key, nonce=nonce, device="cuda:0")
+    bounded = bounded_uint64(bounded_rng, [3, 17], (2, 8))
+    assert bounded.cpu().tolist() == [
+        [2, 0, 1, 2, 2, 1, 1, 1],
+        [12, 11, 11, 7, 5, 13, 12, 4],
+    ]
+    assert bounded_rng.counter == 4
+
+    gaussian_rng = ChaCha20Rng(key=key, nonce=nonce, device="cuda:0")
+    gaussian = discrete_gaussian(gaussian_rng, (16,))
+    assert gaussian.cpu().tolist() == [
+        -3,
+        0,
+        3,
+        -5,
+        -3,
+        2,
+        2,
+        2,
+        -4,
+        3,
+        -3,
+        2,
+        -1,
+        4,
+        -3,
+        1,
+    ]
+    assert gaussian_rng.counter == 4
+
+    round_rng = ChaCha20Rng(key=key, nonce=nonce, device="cuda:0")
+    values = torch.tensor(
+        [
+            -3.75,
+            -3.5,
+            -3.25,
+            -2.75,
+            -2.5,
+            -2.25,
+            -1.75,
+            -1.5,
+            -1.25,
+            0.25,
+            0.5,
+            0.75,
+            1.25,
+            1.5,
+            1.75,
+            2.25,
+        ],
+        dtype=torch.float64,
+        device="cuda:0",
+    )
+    rounded = stochastic_round(round_rng, values)
+    assert rounded.cpu().tolist() == [
+        -4,
+        -4,
+        -3,
+        -3,
+        -2,
+        -2,
+        -2,
+        -2,
+        -1,
+        1,
+        0,
+        1,
+        1,
+        2,
+        1,
+        2,
+    ]
+    assert round_rng.counter == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_device_sampling_constants_are_reused():
+    _cached_bounds_tensor.cache_clear()
+    _device_cdt_thresholds.cache_clear()
+
+    first_bounds = _cached_bounds_tensor((3, 17), "cuda:0")
+    second_bounds = _cached_bounds_tensor((3, 17), "cuda:0")
+    assert first_bounds.data_ptr() == second_bounds.data_ptr()
+    assert _cached_bounds_tensor.cache_info().hits == 1
+
+    first_low, first_high, first_depth = _device_cdt_thresholds(3.2, "cuda:0")
+    second_low, second_high, second_depth = _device_cdt_thresholds(
+        3.2, "cuda:0"
+    )
+    assert first_low.data_ptr() == second_low.data_ptr()
+    assert first_high.data_ptr() == second_high.data_ptr()
+    assert first_depth == second_depth == 5
+    assert _device_cdt_thresholds.cache_info().hits == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_bounded_uint64_two_streams_matches_separate_streams():
     bounds = [3, 17, 5, 257]
     first_expected = ChaCha20Rng(
@@ -83,6 +187,8 @@ def test_bounded_uint64_two_streams_matches_separate_streams():
         first_channels=2,
     )
     assert torch.equal(got, expected)
+    assert first.counter == first_expected.counter == 32
+    assert second.counter == second_expected.counter == 32
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -124,6 +230,14 @@ def test_discrete_gaussian_shape_and_rough_moments():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_discrete_gaussian_zero_depth_table_keeps_stream_semantics():
+    rng = ChaCha20Rng(key=list(range(8)), nonce=[8, 9], device="cuda:0")
+    samples = discrete_gaussian(rng, (16,), sigma=0.15)
+    assert torch.equal(samples, torch.zeros_like(samples))
+    assert rng.counter == 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_discrete_gaussian_symmetry_and_tail_bucket():
     rng = ChaCha20Rng(key=list(range(8)), nonce=[15, 16], device="cuda:0")
     samples = rng.discrete_gaussian((50_000,), sigma=3.2).cpu()
@@ -160,6 +274,8 @@ def test_discrete_gaussian_two_streams_matches_separate_streams():
         first_channels=2,
     )
     assert torch.equal(got, expected)
+    assert first.counter == first_expected.counter == 32
+    assert second.counter == second_expected.counter == 48
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

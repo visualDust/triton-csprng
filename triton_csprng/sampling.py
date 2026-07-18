@@ -297,6 +297,47 @@ def _sample_multiply_high(q, x0, x1, x2, x3, BLOCK: tl.constexpr):
 
 
 @triton.jit
+def _sample_discrete_gaussian(
+    thresholds_low,
+    thresholds_high,
+    x0,
+    x1,
+    x2,
+    x3,
+    tree_depth: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Map one 128-bit word through the sorted half-plane CDT.
+
+    A depth-``d`` table contains ``2**d - 1`` thresholds.  The previous
+    implementation counted all thresholds linearly.  This lower-bound search
+    returns exactly the same count with ``d`` comparisons instead.
+    """
+
+    rnd_low = (x0.to(tl.uint64) << 32) | x1.to(tl.uint64)
+    rnd_high_with_sign = (x2.to(tl.uint64) << 32) | x3.to(tl.uint64)
+    sign_bit = rnd_high_with_sign & 1
+    rnd_high = rnd_high_with_sign >> 1
+    mag = tl.zeros((BLOCK,), dtype=tl.int64)
+    if tree_depth > 0:
+        step: tl.constexpr = 1 << (tree_depth - 1)
+        for _ in tl.static_range(0, tree_depth):
+            threshold_idx = mag + step - 1
+            threshold_low = tl.load(thresholds_low + threshold_idx).to(
+                tl.uint64
+            )
+            threshold_high = tl.load(thresholds_high + threshold_idx).to(
+                tl.uint64
+            )
+            ge = (rnd_high > threshold_high) | (
+                (rnd_high == threshold_high) & (rnd_low >= threshold_low)
+            )
+            mag += ge.to(tl.int64) * step
+            step = step // 2
+    return tl.where(sign_bit == 0, -mag, mag)
+
+
+@triton.jit
 def _fused_bounded_uint64_kernel(
     bounds,
     out,
@@ -359,7 +400,7 @@ def _fused_discrete_gaussian_kernel(
     out,
     n_values,
     n_blocks,
-    table_size: tl.constexpr,
+    tree_depth: tl.constexpr,
     state_words,
     counter_low,
     counter_high,
@@ -397,38 +438,23 @@ def _fused_discrete_gaussian_kernel(
         sample_idx = block_offsets * 4 + group
         mask = block_mask & (sample_idx < n_values)
         if group == 0:
-            x0 = o0.to(tl.uint64)
-            x1 = o1.to(tl.uint64)
-            x2 = o2.to(tl.uint64)
-            x3 = o3.to(tl.uint64)
+            x0, x1, x2, x3 = o0, o1, o2, o3
         elif group == 1:
-            x0 = o4.to(tl.uint64)
-            x1 = o5.to(tl.uint64)
-            x2 = o6.to(tl.uint64)
-            x3 = o7.to(tl.uint64)
+            x0, x1, x2, x3 = o4, o5, o6, o7
         elif group == 2:
-            x0 = o8.to(tl.uint64)
-            x1 = o9.to(tl.uint64)
-            x2 = o10.to(tl.uint64)
-            x3 = o11.to(tl.uint64)
+            x0, x1, x2, x3 = o8, o9, o10, o11
         else:
-            x0 = o12.to(tl.uint64)
-            x1 = o13.to(tl.uint64)
-            x2 = o14.to(tl.uint64)
-            x3 = o15.to(tl.uint64)
-        rnd_low = (x0 << 32) | x1
-        rnd_high_with_sign = (x2 << 32) | x3
-        sign_bit = rnd_high_with_sign & 1
-        rnd_high = rnd_high_with_sign >> 1
-        mag = tl.zeros((BLOCK,), dtype=tl.int64)
-        for i in tl.static_range(0, table_size):
-            threshold_low = tl.load(thresholds_low + i).to(tl.uint64)
-            threshold_high = tl.load(thresholds_high + i).to(tl.uint64)
-            ge = (rnd_high > threshold_high) | (
-                (rnd_high == threshold_high) & (rnd_low >= threshold_low)
-            )
-            mag += ge.to(tl.int64)
-        signed = tl.where(sign_bit == 0, -mag, mag)
+            x0, x1, x2, x3 = o12, o13, o14, o15
+        signed = _sample_discrete_gaussian(
+            thresholds_low,
+            thresholds_high,
+            x0,
+            x1,
+            x2,
+            x3,
+            tree_depth,
+            BLOCK,
+        )
         tl.store(out + sample_idx, signed, mask=mask)
 
 
@@ -587,7 +613,7 @@ def _fused_discrete_gaussian_two_streams_kernel(
     n_values,
     n_blocks,
     n_first_blocks,
-    table_size: tl.constexpr,
+    tree_depth: tl.constexpr,
     state_words_first,
     counter_low_first,
     counter_high_first,
@@ -630,38 +656,23 @@ def _fused_discrete_gaussian_two_streams_kernel(
         sample_idx = block_offsets * 4 + group
         mask = block_mask & (sample_idx < n_values)
         if group == 0:
-            x0 = o0.to(tl.uint64)
-            x1 = o1.to(tl.uint64)
-            x2 = o2.to(tl.uint64)
-            x3 = o3.to(tl.uint64)
+            x0, x1, x2, x3 = o0, o1, o2, o3
         elif group == 1:
-            x0 = o4.to(tl.uint64)
-            x1 = o5.to(tl.uint64)
-            x2 = o6.to(tl.uint64)
-            x3 = o7.to(tl.uint64)
+            x0, x1, x2, x3 = o4, o5, o6, o7
         elif group == 2:
-            x0 = o8.to(tl.uint64)
-            x1 = o9.to(tl.uint64)
-            x2 = o10.to(tl.uint64)
-            x3 = o11.to(tl.uint64)
+            x0, x1, x2, x3 = o8, o9, o10, o11
         else:
-            x0 = o12.to(tl.uint64)
-            x1 = o13.to(tl.uint64)
-            x2 = o14.to(tl.uint64)
-            x3 = o15.to(tl.uint64)
-        rnd_low = (x0 << 32) | x1
-        rnd_high_with_sign = (x2 << 32) | x3
-        sign_bit = rnd_high_with_sign & 1
-        rnd_high = rnd_high_with_sign >> 1
-        mag = tl.zeros((BLOCK,), dtype=tl.int64)
-        for i in tl.static_range(0, table_size):
-            threshold_low = tl.load(thresholds_low + i).to(tl.uint64)
-            threshold_high = tl.load(thresholds_high + i).to(tl.uint64)
-            ge = (rnd_high > threshold_high) | (
-                (rnd_high == threshold_high) & (rnd_low >= threshold_low)
-            )
-            mag += ge.to(tl.int64)
-        signed = tl.where(sign_bit == 0, -mag, mag)
+            x0, x1, x2, x3 = o12, o13, o14, o15
+        signed = _sample_discrete_gaussian(
+            thresholds_low,
+            thresholds_high,
+            x0,
+            x1,
+            x2,
+            x3,
+            tree_depth,
+            BLOCK,
+        )
         tl.store(out + sample_idx, signed, mask=mask)
 
 
@@ -684,37 +695,10 @@ def _bounded_uint64_kernel(
     x2 = tl.load(words + base + 2, mask=mask, other=0).to(tl.uint64)
     x3 = tl.load(words + base + 3, mask=mask, other=0).to(tl.uint64)
 
-    mask32 = tl.full((BLOCK,), 0xFFFFFFFF, dtype=tl.uint64)
-    pl = q & mask32
-    ph = q >> 32
-
     # Return floor(q * U / 2**128) from a 128-bit ChaCha word U.  Counts over
     # the finite 2**128 domain differ by at most one per output bin and there is
     # no rejection fallback path.
-    xl = x1
-    xh = x0
-    plxl = pl * xl
-    plxh = pl * xh
-    phxl = ph * xl
-    phxh = ph * xh
-    carry = (plxl >> 32) + (plxh & mask32) + (phxl & mask32)
-    alpha = phxh + (plxh >> 32) + (phxl >> 32) + (carry >> 32)
-
-    xhh = x2
-    xhl = x3
-    plxhl = pl * xhl
-    plxhh = pl * xhh
-    phxhl = ph * xhl
-    phxhh = ph * xhh
-    carry = ((plxhl & mask32) + (alpha & mask32)) >> 32
-    carry = (
-        carry
-        + (plxhl >> 32)
-        + (alpha >> 32)
-        + (phxhl & mask32)
-        + (plxhh & mask32)
-    ) >> 32
-    sample = carry + (phxhl >> 32) + (plxhh >> 32) + phxhh
+    sample = _sample_multiply_high(q, x0, x1, x2, x3, BLOCK)
     tl.store(out + offs, sample.to(tl.int64), mask=mask)
 
 
@@ -725,29 +709,26 @@ def _discrete_gaussian_kernel(
     thresholds_high,
     out,
     n_values,
-    table_size: tl.constexpr,
+    tree_depth: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n_values
     base = offs * 4
-    x0 = tl.load(words + base + 0, mask=mask, other=0).to(tl.uint64)
-    x1 = tl.load(words + base + 1, mask=mask, other=0).to(tl.uint64)
-    x2 = tl.load(words + base + 2, mask=mask, other=0).to(tl.uint64)
-    x3 = tl.load(words + base + 3, mask=mask, other=0).to(tl.uint64)
-    rnd_low = (x0 << 32) | x1
-    rnd_high_with_sign = (x2 << 32) | x3
-    sign_bit = rnd_high_with_sign & 1
-    rnd_high = rnd_high_with_sign >> 1
-    mag = tl.zeros((BLOCK,), dtype=tl.int64)
-    for i in tl.static_range(0, table_size):
-        threshold_low = tl.load(thresholds_low + i).to(tl.uint64)
-        threshold_high = tl.load(thresholds_high + i).to(tl.uint64)
-        ge = (rnd_high > threshold_high) | (
-            (rnd_high == threshold_high) & (rnd_low >= threshold_low)
-        )
-        mag += ge.to(tl.int64)
-    signed = tl.where(sign_bit == 0, -mag, mag)
+    x0 = tl.load(words + base + 0, mask=mask, other=0)
+    x1 = tl.load(words + base + 1, mask=mask, other=0)
+    x2 = tl.load(words + base + 2, mask=mask, other=0)
+    x3 = tl.load(words + base + 3, mask=mask, other=0)
+    signed = _sample_discrete_gaussian(
+        thresholds_low,
+        thresholds_high,
+        x0,
+        x1,
+        x2,
+        x3,
+        tree_depth,
+        BLOCK,
+    )
     tl.store(out + offs, signed, mask=mask)
 
 
@@ -786,11 +767,9 @@ def _numel(shape: Sequence[int]) -> int:
     return total
 
 
-def _bounds_tensor(
+def _normalize_bounds(
     bounds: int | Sequence[int] | torch.Tensor,
-    *,
-    device: torch.device,
-) -> torch.Tensor:
+) -> tuple[int, ...]:
     if isinstance(bounds, torch.Tensor):
         values = [int(v) for v in bounds.detach().cpu().flatten().tolist()]
     elif isinstance(bounds, int):
@@ -803,8 +782,22 @@ def _bounds_tensor(
         raise ValueError("bounds must be positive")
     if any(v > torch.iinfo(torch.int64).max for v in values):
         raise ValueError("bounds must fit in signed int64 output range")
-    tensor = torch.tensor(values, dtype=torch.uint64, device=device)
-    return tensor.contiguous()
+    return tuple(values)
+
+
+def _bounds_tensor(
+    bounds: int | Sequence[int] | torch.Tensor,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    return _cached_bounds_tensor(_normalize_bounds(bounds), str(device))
+
+
+@functools.lru_cache(maxsize=128)
+def _cached_bounds_tensor(values: tuple[int, ...], device: str) -> torch.Tensor:
+    """Keep small immutable bound vectors resident on their CUDA device."""
+
+    return torch.tensor(values, dtype=torch.uint64, device=device).contiguous()
 
 
 def _can_use_fused(rng: ChaCha20Rng, *, required_words: int) -> bool:
@@ -831,6 +824,12 @@ def _rng_counter_args(rng: ChaCha20Rng) -> tuple[int, int]:
     return counter & 0xFFFFFFFF, (counter >> 32) & 0xFFFFFFFF
 
 
+def _sampling_num_warps(block_size: int) -> int:
+    """Use one warp per 32 independent ChaCha blocks."""
+
+    return max(1, min(8, int(block_size) // 32))
+
+
 def bounded_uint64(
     rng: ChaCha20Rng,
     bounds: int | Sequence[int] | torch.Tensor,
@@ -848,7 +847,8 @@ def bounded_uint64(
     output value and has no retry or fallback branch.
     """
 
-    bound_t = _bounds_tensor(bounds, device=rng.device)
+    bound_values = _normalize_bounds(bounds)
+    bound_t = _cached_bounds_tensor(bound_values, str(rng.device))
     if shape is None:
         out_shape = (bound_t.numel(),)
     else:
@@ -874,11 +874,13 @@ def bounded_uint64(
                 _rng_state_words(rng),
                 *_rng_counter_args(rng),
                 BLOCK=block_size,
+                num_warps=_sampling_num_warps(block_size),
             )
         rng.counter += n_blocks
     else:
         words = rng.uint32(required_words).reshape(-1)
-        grid = (triton.cdiv(n_values, block_size),)
+        sample_block_size = max(128, block_size)
+        grid = (triton.cdiv(n_values, sample_block_size),)
         with torch.cuda.device(rng.device):
             _bounded_uint64_kernel[grid](
                 words,
@@ -886,7 +888,7 @@ def bounded_uint64(
                 out,
                 n_values,
                 values_per_bound,
-                BLOCK=block_size,
+                BLOCK=sample_block_size,
             )
     return out.reshape(out_shape)
 
@@ -920,7 +922,8 @@ def bounded_uint64_two_streams(
     first_values = int(first_channels) * values_per_bound
     if n_values % out_shape[0] != 0 or first_values % 4 != 0 or n_values % 4:
         raise ValueError("two-stream fused sampling requires 4-sample blocks")
-    bound_t = _bounds_tensor(bounds, device=first_rng.device)
+    bound_values = _normalize_bounds(bounds)
+    bound_t = _cached_bounds_tensor(bound_values, str(first_rng.device))
     if bound_t.numel() != out_shape[0]:
         raise ValueError("bounds must contain one value per output channel")
     out = torch.empty((n_values,), dtype=torch.int64, device=first_rng.device)
@@ -940,6 +943,7 @@ def bounded_uint64_two_streams(
             _rng_state_words(second_rng),
             *_rng_counter_args(second_rng),
             BLOCK=block_size,
+            num_warps=_sampling_num_warps(block_size),
         )
     first_rng.counter += n_first_blocks
     second_rng.counter += n_blocks - n_first_blocks
@@ -985,6 +989,28 @@ def _half_plane_cdt_threshold_words(
     return tuple(lows), tuple(highs), sampling_power
 
 
+@functools.lru_cache(maxsize=64)
+def _device_cdt_thresholds(
+    sigma: float, device: str
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Return one reusable device copy of the immutable CDT for ``sigma``."""
+
+    threshold_lows, threshold_highs, tree_depth = (
+        _half_plane_cdt_threshold_words(float(sigma))
+    )
+    threshold_low_t = torch.tensor(
+        threshold_lows,
+        dtype=torch.uint64,
+        device=device,
+    ).contiguous()
+    threshold_high_t = torch.tensor(
+        threshold_highs,
+        dtype=torch.uint64,
+        device=device,
+    ).contiguous()
+    return threshold_low_t, threshold_high_t, tree_depth
+
+
 def discrete_gaussian(
     rng: ChaCha20Rng,
     shape: int | Sequence[int],
@@ -998,18 +1024,8 @@ def discrete_gaussian(
     n_values = _numel(out_shape)
     if n_values == 0:
         return torch.empty(out_shape, dtype=torch.int64, device=rng.device)
-    threshold_lows, threshold_highs, _tree_depth = (
-        _half_plane_cdt_threshold_words(float(sigma))
-    )
-    threshold_low_t = torch.tensor(
-        threshold_lows,
-        dtype=torch.uint64,
-        device=rng.device,
-    )
-    threshold_high_t = torch.tensor(
-        threshold_highs,
-        dtype=torch.uint64,
-        device=rng.device,
+    threshold_low_t, threshold_high_t, tree_depth = _device_cdt_thresholds(
+        float(sigma), str(rng.device)
     )
     out = torch.empty((n_values,), dtype=torch.int64, device=rng.device)
     required_words = n_values * 4
@@ -1023,15 +1039,17 @@ def discrete_gaussian(
                 out,
                 n_values,
                 n_blocks,
-                threshold_low_t.numel(),
+                tree_depth,
                 _rng_state_words(rng),
                 *_rng_counter_args(rng),
                 BLOCK=block_size,
+                num_warps=_sampling_num_warps(block_size),
             )
         rng.counter += n_blocks
     else:
         words = rng.uint32(required_words).reshape(-1)
-        grid = (triton.cdiv(n_values, block_size),)
+        sample_block_size = max(128, block_size)
+        grid = (triton.cdiv(n_values, sample_block_size),)
         with torch.cuda.device(rng.device):
             _discrete_gaussian_kernel[grid](
                 words,
@@ -1039,8 +1057,8 @@ def discrete_gaussian(
                 threshold_high_t,
                 out,
                 n_values,
-                threshold_low_t.numel(),
-                BLOCK=block_size,
+                tree_depth,
+                BLOCK=sample_block_size,
             )
     return out.reshape(out_shape)
 
@@ -1068,18 +1086,8 @@ def discrete_gaussian_two_streams(
     first_values = int(first_channels) * values_per_channel
     if n_values % out_shape[0] != 0 or first_values % 4 != 0 or n_values % 4:
         raise ValueError("two-stream fused sampling requires 4-sample blocks")
-    threshold_lows, threshold_highs, _tree_depth = (
-        _half_plane_cdt_threshold_words(float(sigma))
-    )
-    threshold_low_t = torch.tensor(
-        threshold_lows,
-        dtype=torch.uint64,
-        device=first_rng.device,
-    )
-    threshold_high_t = torch.tensor(
-        threshold_highs,
-        dtype=torch.uint64,
-        device=first_rng.device,
+    threshold_low_t, threshold_high_t, tree_depth = _device_cdt_thresholds(
+        float(sigma), str(first_rng.device)
     )
     out = torch.empty((n_values,), dtype=torch.int64, device=first_rng.device)
     n_blocks = n_values // 4
@@ -1093,12 +1101,13 @@ def discrete_gaussian_two_streams(
             n_values,
             n_blocks,
             n_first_blocks,
-            threshold_low_t.numel(),
+            tree_depth,
             _rng_state_words(first_rng),
             *_rng_counter_args(first_rng),
             _rng_state_words(second_rng),
             *_rng_counter_args(second_rng),
             BLOCK=block_size,
+            num_warps=_sampling_num_warps(block_size),
         )
     first_rng.counter += n_first_blocks
     second_rng.counter += n_blocks - n_first_blocks
@@ -1134,13 +1143,19 @@ def stochastic_round(
                 _rng_state_words(rng),
                 *_rng_counter_args(rng),
                 BLOCK=block_size,
+                num_warps=_sampling_num_warps(block_size),
             )
         rng.counter += n_blocks
     else:
         words = rng.uint32(n_values).reshape(-1)
-        grid = (triton.cdiv(n_values, block_size),)
+        sample_block_size = max(128, block_size)
+        grid = (triton.cdiv(n_values, sample_block_size),)
         with torch.cuda.device(rng.device):
             _stochastic_round_kernel[grid](
-                values.reshape(-1), words, out, n_values, BLOCK=block_size
+                values.reshape(-1),
+                words,
+                out,
+                n_values,
+                BLOCK=sample_block_size,
             )
     return out.reshape(values.shape)

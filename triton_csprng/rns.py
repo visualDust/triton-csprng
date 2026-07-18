@@ -109,7 +109,9 @@ class RnsRandomStreams:
                 parts.append(
                     self._repeat_streams[idx].uint32((repeats, self.num_coeffs))
                 )
-            if parts:
+            if len(parts) == 1:
+                outputs.append(parts[0])
+            elif parts:
                 outputs.append(torch.cat(parts, dim=0))
             else:
                 outputs.append(
@@ -143,43 +145,50 @@ class RnsRandomStreams:
         outputs = []
         for idx, bounds in enumerate(bounds_by_device):
             stream = self._device_streams[idx]
-            bounds_t = torch.as_tensor(
-                bounds, dtype=torch.uint64, device=stream.device
-            ).flatten()
-            if repeats > bounds_t.numel():
+            if isinstance(bounds, torch.Tensor):
+                bound_values = [
+                    int(value)
+                    for value in bounds.detach().cpu().flatten().tolist()
+                ]
+            else:
+                bound_values = [int(value) for value in bounds]
+            num_bounds = len(bound_values)
+            if repeats > num_bounds:
                 raise ValueError("repeated_channels cannot exceed bound count")
             parts = []
-            non_repeat_count = bounds_t.numel() - repeats
+            non_repeat_count = num_bounds - repeats
             if non_repeat_count > 0 and repeats > 0:
                 outputs.append(
                     bounded_uint64_two_streams(
                         stream,
                         self._repeat_streams[idx],
-                        bounds_t,
-                        (bounds_t.numel(), self.num_coeffs),
+                        bound_values,
+                        (num_bounds, self.num_coeffs),
                         first_channels=non_repeat_count,
                     )
                 )
                 continue
             if non_repeat_count > 0:
-                non_repeat_bounds = bounds_t[:non_repeat_count]
+                non_repeat_bounds = bound_values[:non_repeat_count]
                 parts.append(
                     bounded_uint64(
                         stream,
                         non_repeat_bounds,
-                        (non_repeat_bounds.numel(), self.num_coeffs),
+                        (len(non_repeat_bounds), self.num_coeffs),
                     )
                 )
             if repeats > 0:
-                repeat_bounds = bounds_t[non_repeat_count:]
+                repeat_bounds = bound_values[non_repeat_count:]
                 parts.append(
                     bounded_uint64(
                         self._repeat_streams[idx],
                         repeat_bounds,
-                        (repeat_bounds.numel(), self.num_coeffs),
+                        (len(repeat_bounds), self.num_coeffs),
                     )
                 )
-            if parts:
+            if len(parts) == 1:
+                outputs.append(parts[0])
+            elif parts:
                 outputs.append(torch.cat(parts, dim=0))
             else:
                 outputs.append(
@@ -236,7 +245,9 @@ class RnsRandomStreams:
                         sigma=sigma,
                     )
                 )
-            if parts:
+            if len(parts) == 1:
+                outputs.append(parts[0])
+            elif parts:
                 outputs.append(torch.cat(parts, dim=0))
             else:
                 outputs.append(
