@@ -57,7 +57,7 @@ def _numel(shape: int | Sequence[int]) -> int:
 
 
 class ChaCha20Rng:
-    """Counter-based ChaCha20 stream backed by Triton kernels.
+    """Counter-based ChaCha20 stream for CPU and CUDA tensors.
 
     This is intentionally a small low-level primitive.  Callers own their
     stream layout and request raw uint32 words or bytes from an explicit
@@ -73,8 +73,10 @@ class ChaCha20Rng:
         device: torch.device | str = "cuda:0",
     ) -> None:
         self.device = torch.device(device)
-        if self.device.type != "cuda":
-            raise ValueError("ChaCha20Rng currently requires a CUDA device")
+        if self.device.type not in {"cpu", "cuda"}:
+            raise ValueError("ChaCha20Rng requires a CPU or CUDA device")
+        if counter < 0 or counter >= 1 << 64:
+            raise ValueError("counter must fit in unsigned 64-bit state")
         self.key_words = _normalize_words(key, n_words=8, name="key")
         self.nonce_words = _normalize_words(nonce, n_words=2, name="nonce")
         self.counter = int(counter)
@@ -87,6 +89,8 @@ class ChaCha20Rng:
 
         if num_blocks <= 0:
             raise ValueError("num_blocks must be positive")
+        if self.counter + num_blocks > 1 << 64:
+            raise OverflowError("ChaCha20 counter space is exhausted")
         state = make_chacha20_state(
             num_blocks=num_blocks,
             key=self.key_words,
@@ -97,6 +101,10 @@ class ChaCha20Rng:
         out = chacha20_blocks(state, step=0)
         self.counter += num_blocks
         return out
+
+    def _require_counter_blocks(self, num_blocks: int) -> None:
+        if num_blocks < 0 or self.counter + num_blocks > 1 << 64:
+            raise OverflowError("ChaCha20 counter space is exhausted")
 
     def uint32(self, shape: int | Sequence[int]) -> torch.Tensor:
         """Return random uint32 words with `shape`."""
@@ -112,7 +120,7 @@ class ChaCha20Rng:
         return words.reshape(shape)
 
     def bytes(self, shape: int | Sequence[int]) -> torch.Tensor:
-        """Return random bytes with `shape` as a `torch.uint8` CUDA tensor."""
+        """Return random bytes with `shape` on the configured device."""
 
         n_bytes = _numel(shape)
         if n_bytes < 0:

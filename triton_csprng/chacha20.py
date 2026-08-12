@@ -35,20 +35,30 @@ def make_chacha20_state(
     64-bit counter in 12..13, and 64-bit nonce in 14..15.
     """
 
+    target_device = torch.device(device)
+    if target_device.type not in {"cpu", "cuda"}:
+        raise ValueError("ChaCha20 state requires a CPU or CUDA device")
     if num_blocks <= 0:
         raise ValueError("num_blocks must be positive")
-    key_t = _as_uint32_tensor(key, device=device, length=8, name="key")
-    nonce_t = _as_uint32_tensor(nonce, device=device, length=2, name="nonce")
-    state = torch.zeros((num_blocks, 16), dtype=torch.uint32, device=device)
+    if counter < 0 or counter + num_blocks > 1 << 64:
+        raise ValueError("counter interval must fit in unsigned 64-bit state")
+    key_t = _as_uint32_tensor(key, device=target_device, length=8, name="key")
+    nonce_t = _as_uint32_tensor(
+        nonce, device=target_device, length=2, name="nonce"
+    )
+    state = torch.zeros(
+        (num_blocks, 16), dtype=torch.uint32, device=target_device
+    )
     state[:, 0:4] = torch.tensor(
-        _CHACHA20_CONST, dtype=torch.uint32, device=device
+        _CHACHA20_CONST, dtype=torch.uint32, device=target_device
     )
     state[:, 4:12] = key_t[None, :]
-    counters = torch.arange(
-        counter, counter + num_blocks, dtype=torch.int64, device=device
+    offsets = torch.arange(num_blocks, dtype=torch.int64, device=target_device)
+    low_with_carry = offsets + (counter & _MASK32)
+    state[:, 12] = (low_with_carry & _MASK32).to(torch.uint32)
+    state[:, 13] = (((counter >> 32) + (low_with_carry >> 32)) & _MASK32).to(
+        torch.uint32
     )
-    state[:, 12] = (counters & _MASK32).to(torch.uint32)
-    state[:, 13] = ((counters >> 32) & _MASK32).to(torch.uint32)
     state[:, 14:16] = nonce_t[None, :]
     return state.contiguous()
 
@@ -171,6 +181,23 @@ def _chacha20_blocks_kernel(
         tl.store(states + base + 13, new_high, mask=mask)
 
 
+def _rotl32_cpu(value: torch.Tensor, shift: int) -> torch.Tensor:
+    return ((value << shift) | (value >> (32 - shift))) & _MASK32
+
+
+def _quarter_round_cpu(
+    state: list[torch.Tensor], a: int, b: int, c: int, d: int
+) -> None:
+    state[a] = (state[a] + state[b]) & _MASK32
+    state[d] = _rotl32_cpu(state[d] ^ state[a], 16)
+    state[c] = (state[c] + state[d]) & _MASK32
+    state[b] = _rotl32_cpu(state[b] ^ state[c], 12)
+    state[a] = (state[a] + state[b]) & _MASK32
+    state[d] = _rotl32_cpu(state[d] ^ state[a], 8)
+    state[c] = (state[c] + state[d]) & _MASK32
+    state[b] = _rotl32_cpu(state[b] ^ state[c], 7)
+
+
 def chacha20_blocks(
     states: torch.Tensor,
     *,
@@ -187,9 +214,35 @@ def chacha20_blocks(
         raise ValueError("states must have shape [num_blocks, 16]")
     if states.dtype is not torch.uint32:
         raise TypeError("states must use torch.uint32")
-    if not states.is_cuda:
-        raise ValueError("Triton CSPRNG kernels require CUDA tensors")
+    if states.device.type not in {"cpu", "cuda"}:
+        raise ValueError("states must be on a CPU or CUDA device")
     states = states.contiguous()
+    if not states.is_cuda:
+        original = [column.to(torch.int64) for column in states.unbind(1)]
+        working = [column.clone() for column in original]
+        for _ in range(10):
+            _quarter_round_cpu(working, 0, 4, 8, 12)
+            _quarter_round_cpu(working, 1, 5, 9, 13)
+            _quarter_round_cpu(working, 2, 6, 10, 14)
+            _quarter_round_cpu(working, 3, 7, 11, 15)
+            _quarter_round_cpu(working, 0, 5, 10, 15)
+            _quarter_round_cpu(working, 1, 6, 11, 12)
+            _quarter_round_cpu(working, 2, 7, 8, 13)
+            _quarter_round_cpu(working, 3, 4, 9, 14)
+        if step:
+            counters = states[:, 12].to(torch.int64) + int(step)
+            carry = counters >> 32
+            states[:, 12] = (counters & _MASK32).to(torch.uint32)
+            states[:, 13] = (states[:, 13].to(torch.int64) + carry).to(
+                torch.uint32
+            )
+        return torch.stack(
+            [
+                ((value + initial) & _MASK32).to(torch.uint32)
+                for value, initial in zip(working, original, strict=True)
+            ],
+            dim=1,
+        )
     out = torch.empty_like(states)
     n_blocks = states.shape[0]
     grid = (triton.cdiv(n_blocks, block_size),)

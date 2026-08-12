@@ -34,8 +34,10 @@ def _chacha20_reference(block):
     return [(a + b) & 0xFFFFFFFF for a, b in zip(x, s)]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_chacha20_blocks_matches_reference():
+@pytest.mark.parametrize(
+    "device", ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
+)
+def test_chacha20_blocks_matches_reference(device):
     key = [
         0x03020100,
         0x07060504,
@@ -48,7 +50,7 @@ def test_chacha20_blocks_matches_reference():
     ]
     nonce = [0x09000000, 0x4A000000]
     state = make_chacha20_state(
-        num_blocks=3, key=key, nonce=nonce, counter=1, device="cuda:0"
+        num_blocks=3, key=key, nonce=nonce, counter=1, device=device
     )
     original = state.clone()
     out = chacha20_blocks(state, step=7)
@@ -68,3 +70,15 @@ def test_chacha20_blocks_supports_non_multiple_block_counts():
     out = chacha20_blocks(state, step=0, block_size=128)
     assert out.shape == (130, 16)
     assert out.dtype is torch.uint32
+
+
+def test_chacha20_rejects_non_cpu_cuda_devices():
+    with pytest.raises(ValueError, match="CPU or CUDA"):
+        make_chacha20_state(
+            num_blocks=1,
+            key=list(range(8)),
+            nonce=[1, 2],
+            device="meta",
+        )
+    with pytest.raises(ValueError, match="CPU or CUDA"):
+        chacha20_blocks(torch.empty((1, 16), dtype=torch.uint32, device="meta"))

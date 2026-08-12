@@ -302,3 +302,77 @@ def test_stream_distribution_methods():
     assert rng.discrete_gaussian((2, 16)).shape == (2, 16)
     values = torch.linspace(-1.0, 1.0, 16, device="cuda:0")
     assert rng.stochastic_round(values).shape == (16,)
+
+
+def test_cpu_sampling_regression_and_cuda_parity():
+    key = list(range(8))
+    nonce = [101, 202]
+    bounded_cpu = bounded_uint64(
+        ChaCha20Rng(key=key, nonce=nonce, device="cpu"), [3, 17], (2, 8)
+    )
+    gaussian_cpu = discrete_gaussian(
+        ChaCha20Rng(key=key, nonce=nonce, device="cpu"), (16,)
+    )
+    values = torch.tensor(
+        [-3.75, -3.5, -3.25, -2.75, 0.25, 0.5, 0.75, 2.25],
+        dtype=torch.float64,
+    )
+    rounded_cpu = stochastic_round(
+        ChaCha20Rng(key=key, nonce=nonce, device="cpu"), values
+    )
+    assert bounded_cpu.tolist() == [
+        [2, 0, 1, 2, 2, 1, 1, 1],
+        [12, 11, 11, 7, 5, 13, 12, 4],
+    ]
+    assert gaussian_cpu.tolist() == [
+        -3,
+        0,
+        3,
+        -5,
+        -3,
+        2,
+        2,
+        2,
+        -4,
+        3,
+        -3,
+        2,
+        -1,
+        4,
+        -3,
+        1,
+    ]
+    assert rounded_cpu.tolist() == [-4, -4, -3, -3, 0, 0, 1, 2]
+    if torch.cuda.is_available():
+        bounded_cuda = bounded_uint64(
+            ChaCha20Rng(key=key, nonce=nonce, device="cuda:0"),
+            [3, 17],
+            (2, 8),
+        )
+        gaussian_cuda = discrete_gaussian(
+            ChaCha20Rng(key=key, nonce=nonce, device="cuda:0"), (16,)
+        )
+        rounded_cuda = stochastic_round(
+            ChaCha20Rng(key=key, nonce=nonce, device="cuda:0"),
+            values.cuda(),
+        )
+        assert torch.equal(bounded_cpu, bounded_cuda.cpu())
+        assert torch.equal(gaussian_cpu, gaussian_cuda.cpu())
+        assert torch.equal(rounded_cpu, rounded_cuda.cpu())
+
+
+def test_sampling_rejects_negative_shapes_and_invalid_stream_splits():
+    first = ChaCha20Rng(key=list(range(8)), nonce=[1, 2], device="cpu")
+    second = ChaCha20Rng(key=list(range(8)), nonce=[3, 4], device="cpu")
+    with pytest.raises(ValueError, match="non-negative"):
+        bounded_uint64(first, 17, (-2, -3))
+    with pytest.raises(ValueError, match="split both"):
+        bounded_uint64_two_streams(
+            first, second, [17, 19], (2, 8), first_channels=0
+        )
+    with pytest.raises(ValueError, match="one value per output channel"):
+        bounded_uint64_two_streams(
+            first, second, [17], (2, 8), first_channels=1
+        )
+    with pytest.raises(ValueError, match="split both"):
+        discrete_gaussian_two_streams(first, second, (2, 8), first_channels=2)

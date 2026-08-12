@@ -21,7 +21,7 @@ def _derive_nonce(base: Sequence[int], stream_id: int) -> list[int]:
 
 
 class RnsRandomStreams:
-    """Convenience stream manager for FHE-style RNS channel layouts.
+    """Convenience stream manager for CPU or CUDA RNS channel layouts.
 
     The class only knows about devices, per-device non-repeating channel counts,
     a common repeated-channel stream, and a coefficient count.  Higher-level
@@ -56,8 +56,13 @@ class RnsRandomStreams:
             raise ValueError(
                 "devices and channel_counts must have the same length"
             )
-        if any(device.type != "cuda" for device in self.devices):
-            raise ValueError("RnsRandomStreams currently requires CUDA devices")
+        if not self.devices:
+            raise ValueError("RnsRandomStreams requires at least one device")
+        device_types = {device.type for device in self.devices}
+        if len(device_types) != 1 or not device_types <= {"cpu", "cuda"}:
+            raise ValueError(
+                "RnsRandomStreams devices must be all CPU or all CUDA"
+            )
 
         seed_stream = ChaCha20Rng(
             key=key, nonce=nonce, counter=counter, device=self.devices[0]

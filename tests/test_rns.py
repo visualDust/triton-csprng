@@ -63,3 +63,32 @@ def test_rns_random_streams_state_roundtrip_single_device():
     got = streams.uint32_channels()
     expected = restored.uint32_channels()
     assert torch.equal(got[0], expected[0])
+
+
+def test_cpu_rns_random_stream_shapes_ranges_and_state():
+    streams = RnsRandomStreams(
+        num_coeffs=32,
+        channel_counts=[2],
+        repeated_channels=1,
+        devices=["cpu"],
+        key=list(range(8)),
+        nonce=[10, 20],
+    )
+    integers = streams.randint_channels([[17, 19, 23]])
+    gaussian = streams.discrete_gaussian_channels()
+    assert integers[0].shape == (3, 32)
+    assert int(integers[0][0].max()) < 17
+    assert gaussian[0].shape == (3, 32)
+    restored = RnsRandomStreams.from_state_dict(streams.state_dict())
+    assert torch.equal(
+        streams.uint32_channels()[0], restored.uint32_channels()[0]
+    )
+
+
+def test_rns_random_streams_rejects_empty_device_inventory():
+    with pytest.raises(ValueError, match="at least one device"):
+        RnsRandomStreams(
+            num_coeffs=16,
+            channel_counts=[],
+            devices=[],
+        )

@@ -1,21 +1,21 @@
 # triton-csprng
 
 `triton-csprng` is a small PyTorch/Triton package for counter-based random
-streams on NVIDIA GPUs. It provides ChaCha20-backed CUDA tensor generation and a
-few sampling primitives that are useful for cryptography-adjacent, simulation,
-and FHE-style workloads.
+streams on CPU and NVIDIA GPUs. It provides ChaCha20-backed tensor generation
+and sampling primitives for cryptography-adjacent, simulation, and FHE-style
+workloads.
 
 The package exposes low-level stream and sampling building blocks without
 depending on any downstream library's RNG API.
 
 ## What is implemented
 
-- ChaCha20 block generation in Triton.
+- ChaCha20 block generation with vectorized PyTorch CPU and Triton CUDA paths.
 - Explicit key / nonce / counter stream state.
-- Raw `uint32(...)` and `bytes(...)` APIs returning ordinary CUDA tensors.
+- Raw `uint32(...)` and `bytes(...)` APIs returning ordinary PyTorch tensors.
 - Bounded integer sampling with scalar or per-channel bounds.
 - Centered integer discrete Gaussian sampling from a 128-bit half-plane CDT.
-- Stochastic rounding for CUDA floating tensors.
+- Stochastic rounding for CPU and CUDA floating tensors.
 - `RnsRandomStreams`, a convenience manager for RNS-like layouts with:
   - independent streams per device for non-repeated channels;
   - repeated channels that reproduce the same values across devices;
@@ -39,10 +39,9 @@ python -m pip install -e ".[dev]"
 ```
 
 Runtime dependencies are PyTorch, Triton, and `mpmath` for high-precision CDT
-construction. The current implementation is CUDA-only because Triton kernels
-require CUDA tensors. In production-like CUDA environments, install the
-PyTorch/Triton build that matches the target CUDA stack first, then install this
-package.
+construction. CPU execution uses PyTorch tensor operations and the same
+ChaCha20 stream and sampling mappings as CUDA. In CUDA environments, install
+the PyTorch/Triton build that matches the target CUDA stack first.
 
 ## Quick start
 
@@ -64,9 +63,8 @@ gauss = rng.discrete_gaussian((4, 1024), sigma=3.2)
 rounded = rng.stochastic_round(torch.randn(1024, device="cuda:0"))
 ```
 
-Every result above is a normal PyTorch CUDA tensor. Triton kernels are launched
-directly from Python with PyTorch tensor pointers, so callers can pass outputs
-straight into ordinary PyTorch code.
+Every result above is a normal PyTorch tensor. Use `device="cpu"` to select the
+CPU implementation without changing the stream or sampling APIs.
 
 ## Stream semantics
 
@@ -141,9 +139,9 @@ The result is `torch.int64` with Bernoulli rounding by the fractional part of
 
 ## RNS-style stream manager
 
-`RnsRandomStreams` helps express layouts where each GPU gets independent
-non-repeated channels, while repeated channels are generated from matching
-streams on every GPU.
+`RnsRandomStreams` helps express layouts where each configured CPU or CUDA
+device gets independent non-repeated channels, while repeated channels are
+generated from matching streams on every device.
 
 ```python
 from triton_csprng import RnsRandomStreams
@@ -183,10 +181,11 @@ out = torch.empty_like(x)
 _kernel[grid](x, out, ...)
 ```
 
-That is what this package does. A `torch.ops.*` custom op is unnecessary for
-normal Python/PyTorch integration and would reintroduce dispatcher/wrapper
-maintenance. A `torch.library` wrapper can still be added later if a downstream
-project needs formal fake-tensor or `torch.compile` dispatcher integration.
+CUDA paths launch Triton kernels this way; CPU paths use ordinary PyTorch tensor
+operations. A `torch.ops.*` custom op is unnecessary for normal Python/PyTorch
+integration and would reintroduce dispatcher/wrapper maintenance. A
+`torch.library` wrapper can still be added later if a downstream project needs
+formal fake-tensor or `torch.compile` dispatcher integration.
 
 ## Developer checks
 
@@ -218,7 +217,7 @@ python -m pytest tests -q
 
 The tests cover:
 
-- ChaCha20 Triton output against a Python reference implementation;
+- ChaCha20 CPU and Triton output against a Python reference implementation;
 - non-multiple block counts;
 - stream determinism and chunking behavior;
 - state-dict restore;
@@ -227,4 +226,5 @@ The tests cover:
 - half-plane CDT table shape/range checks;
 - rough discrete Gaussian moments and symmetry;
 - stochastic-rounding determinism and integer cases;
-- RNS repeated-channel equality across two GPUs.
+- exact seeded CPU/CUDA stream and sampling parity;
+- CPU RNS state restore and repeated-channel equality across two GPUs.

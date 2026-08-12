@@ -756,8 +756,12 @@ def _stochastic_round_kernel(
 
 def _as_shape(shape: int | Sequence[int]) -> tuple[int, ...]:
     if isinstance(shape, int):
-        return (shape,)
-    return tuple(int(dim) for dim in shape)
+        dimensions = (shape,)
+    else:
+        dimensions = tuple(int(dim) for dim in shape)
+    if any(dim < 0 for dim in dimensions):
+        raise ValueError("shape dimensions must be non-negative")
+    return dimensions
 
 
 def _numel(shape: Sequence[int]) -> int:
@@ -795,7 +799,7 @@ def _bounds_tensor(
 
 @functools.lru_cache(maxsize=128)
 def _cached_bounds_tensor(values: tuple[int, ...], device: str) -> torch.Tensor:
-    """Keep small immutable bound vectors resident on their CUDA device."""
+    """Keep small immutable bound vectors resident on their execution device."""
 
     return torch.tensor(values, dtype=torch.uint64, device=device).contiguous()
 
@@ -830,6 +834,62 @@ def _sampling_num_warps(block_size: int) -> int:
     return max(1, min(8, int(block_size) // 32))
 
 
+def _cpu_uint128_words(rng: ChaCha20Rng, n_values: int) -> list[list[int]]:
+    return rng.uint32(n_values * 4).reshape(-1, 4).tolist()
+
+
+def _cpu_bounded_uint64(
+    rng: ChaCha20Rng,
+    bounds: Sequence[int],
+    out_shape: tuple[int, ...],
+) -> torch.Tensor:
+    n_values = _numel(out_shape)
+    if n_values == 0:
+        return torch.empty(out_shape, dtype=torch.int64, device=rng.device)
+    if n_values % len(bounds) != 0:
+        raise ValueError("output size must be divisible by number of bounds")
+    values_per_bound = n_values // len(bounds)
+    words = _cpu_uint128_words(rng, n_values)
+    samples = []
+    for index, row in enumerate(words):
+        low = (int(row[0]) << 32) | int(row[1])
+        high = (int(row[2]) << 32) | int(row[3])
+        random_value = low | (high << 64)
+        bound = int(bounds[index // values_per_bound])
+        samples.append((bound * random_value) >> 128)
+    return torch.tensor(samples, dtype=torch.int64).reshape(out_shape)
+
+
+def _cpu_discrete_gaussian(
+    rng: ChaCha20Rng, out_shape: tuple[int, ...], sigma: float
+) -> torch.Tensor:
+    n_values = _numel(out_shape)
+    if n_values == 0:
+        return torch.empty(out_shape, dtype=torch.int64, device=rng.device)
+    lows, highs, depth = _half_plane_cdt_threshold_words(float(sigma))
+    thresholds = [
+        (int(high) << 64) | int(low)
+        for low, high in zip(lows, highs, strict=True)
+    ]
+    samples: list[int] = []
+    for row in _cpu_uint128_words(rng, n_values):
+        low = (int(row[0]) << 32) | int(row[1])
+        high_with_sign = (int(row[2]) << 32) | int(row[3])
+        sign = high_with_sign & 1
+        high = high_with_sign >> 1
+        random_value = (high << 64) | low
+        magnitude = 0
+        if depth > 0:
+            step = 1 << (depth - 1)
+            for _ in range(depth):
+                threshold_index = magnitude + step - 1
+                if random_value >= thresholds[threshold_index]:
+                    magnitude += step
+                step //= 2
+        samples.append(magnitude if sign else -magnitude)
+    return torch.tensor(samples, dtype=torch.int64).reshape(out_shape)
+
+
 def bounded_uint64(
     rng: ChaCha20Rng,
     bounds: int | Sequence[int] | torch.Tensor,
@@ -837,7 +897,7 @@ def bounded_uint64(
     *,
     block_size: int = 128,
 ) -> torch.Tensor:
-    """Sample integers in `[0, bound)` as an int64 CUDA tensor.
+    """Sample integers in `[0, bound)` as an int64 tensor.
 
     `bounds` may be a scalar or one bound per leading channel.  When multiple
     bounds are supplied, the output is flattened as `[num_bounds, values_per_bound]`
@@ -848,11 +908,13 @@ def bounded_uint64(
     """
 
     bound_values = _normalize_bounds(bounds)
-    bound_t = _cached_bounds_tensor(bound_values, str(rng.device))
     if shape is None:
-        out_shape = (bound_t.numel(),)
+        out_shape = (len(bound_values),)
     else:
         out_shape = _as_shape(shape)
+    if rng.device.type == "cpu":
+        return _cpu_bounded_uint64(rng, bound_values, out_shape)
+    bound_t = _cached_bounds_tensor(bound_values, str(rng.device))
     n_values = _numel(out_shape)
     if n_values == 0:
         return torch.empty(out_shape, dtype=torch.int64, device=rng.device)
@@ -863,6 +925,7 @@ def bounded_uint64(
     required_words = n_values * 4
     if _can_use_fused(rng, required_words=required_words):
         n_blocks = required_words // 16
+        rng._require_counter_blocks(n_blocks)
         grid = (triton.cdiv(n_blocks, block_size),)
         with torch.cuda.device(rng.device):
             _fused_bounded_uint64_kernel[grid](
@@ -912,23 +975,43 @@ def bounded_uint64_two_streams(
 
     if first_rng.device != second_rng.device:
         raise ValueError("streams must live on the same device")
+    out_shape = _as_shape(shape)
+    if len(out_shape) < 2 or out_shape[0] <= 0:
+        raise ValueError("shape must be channel-major with at least 2 dims")
+    first_channels = int(first_channels)
+    if first_channels <= 0 or first_channels >= out_shape[0]:
+        raise ValueError("first_channels must split both channel groups")
+    n_values = _numel(out_shape)
+    if n_values % out_shape[0] != 0:
+        raise ValueError("output size must be divisible by channel count")
+    bound_values = _normalize_bounds(bounds)
+    if len(bound_values) != out_shape[0]:
+        raise ValueError("bounds must contain one value per output channel")
+    if first_rng.device.type == "cpu":
+        values_per_channel = _numel(out_shape) // out_shape[0]
+        first = _cpu_bounded_uint64(
+            first_rng,
+            bound_values[:first_channels],
+            (first_channels, values_per_channel),
+        )
+        second = _cpu_bounded_uint64(
+            second_rng,
+            bound_values[first_channels:],
+            (out_shape[0] - first_channels, values_per_channel),
+        )
+        return torch.cat((first, second), dim=0).reshape(out_shape)
     if first_rng._pending_bytes.numel() or second_rng._pending_bytes.numel():
         raise ValueError("two-stream fused sampling requires aligned streams")
-    out_shape = _as_shape(shape)
-    if len(out_shape) < 2:
-        raise ValueError("shape must be channel-major with at least 2 dims")
-    n_values = _numel(out_shape)
     values_per_bound = n_values // out_shape[0]
-    first_values = int(first_channels) * values_per_bound
-    if n_values % out_shape[0] != 0 or first_values % 4 != 0 or n_values % 4:
+    first_values = first_channels * values_per_bound
+    if first_values % 4 != 0 or n_values % 4:
         raise ValueError("two-stream fused sampling requires 4-sample blocks")
-    bound_values = _normalize_bounds(bounds)
     bound_t = _cached_bounds_tensor(bound_values, str(first_rng.device))
-    if bound_t.numel() != out_shape[0]:
-        raise ValueError("bounds must contain one value per output channel")
     out = torch.empty((n_values,), dtype=torch.int64, device=first_rng.device)
     n_blocks = n_values // 4
     n_first_blocks = first_values // 4
+    first_rng._require_counter_blocks(n_first_blocks)
+    second_rng._require_counter_blocks(n_blocks - n_first_blocks)
     grid = (triton.cdiv(n_blocks, block_size),)
     with torch.cuda.device(first_rng.device):
         _fused_bounded_uint64_two_streams_kernel[grid](
@@ -1024,6 +1107,8 @@ def discrete_gaussian(
     n_values = _numel(out_shape)
     if n_values == 0:
         return torch.empty(out_shape, dtype=torch.int64, device=rng.device)
+    if rng.device.type == "cpu":
+        return _cpu_discrete_gaussian(rng, out_shape, float(sigma))
     threshold_low_t, threshold_high_t, tree_depth = _device_cdt_thresholds(
         float(sigma), str(rng.device)
     )
@@ -1031,6 +1116,7 @@ def discrete_gaussian(
     required_words = n_values * 4
     if _can_use_fused(rng, required_words=required_words):
         n_blocks = required_words // 16
+        rng._require_counter_blocks(n_blocks)
         grid = (triton.cdiv(n_blocks, block_size),)
         with torch.cuda.device(rng.device):
             _fused_discrete_gaussian_kernel[grid](
@@ -1076,15 +1162,33 @@ def discrete_gaussian_two_streams(
 
     if first_rng.device != second_rng.device:
         raise ValueError("streams must live on the same device")
+    out_shape = _as_shape(shape)
+    if len(out_shape) < 2 or out_shape[0] <= 0:
+        raise ValueError("shape must be channel-major with at least 2 dims")
+    first_channels = int(first_channels)
+    if first_channels <= 0 or first_channels >= out_shape[0]:
+        raise ValueError("first_channels must split both channel groups")
+    n_values = _numel(out_shape)
+    if n_values % out_shape[0] != 0:
+        raise ValueError("output size must be divisible by channel count")
+    if first_rng.device.type == "cpu":
+        values_per_channel = _numel(out_shape) // out_shape[0]
+        first = _cpu_discrete_gaussian(
+            first_rng,
+            (first_channels, values_per_channel),
+            float(sigma),
+        )
+        second = _cpu_discrete_gaussian(
+            second_rng,
+            (out_shape[0] - first_channels, values_per_channel),
+            float(sigma),
+        )
+        return torch.cat((first, second), dim=0).reshape(out_shape)
     if first_rng._pending_bytes.numel() or second_rng._pending_bytes.numel():
         raise ValueError("two-stream fused sampling requires aligned streams")
-    out_shape = _as_shape(shape)
-    if len(out_shape) < 2:
-        raise ValueError("shape must be channel-major with at least 2 dims")
-    n_values = _numel(out_shape)
     values_per_channel = n_values // out_shape[0]
-    first_values = int(first_channels) * values_per_channel
-    if n_values % out_shape[0] != 0 or first_values % 4 != 0 or n_values % 4:
+    first_values = first_channels * values_per_channel
+    if first_values % 4 != 0 or n_values % 4:
         raise ValueError("two-stream fused sampling requires 4-sample blocks")
     threshold_low_t, threshold_high_t, tree_depth = _device_cdt_thresholds(
         float(sigma), str(first_rng.device)
@@ -1092,6 +1196,8 @@ def discrete_gaussian_two_streams(
     out = torch.empty((n_values,), dtype=torch.int64, device=first_rng.device)
     n_blocks = n_values // 4
     n_first_blocks = first_values // 4
+    first_rng._require_counter_blocks(n_first_blocks)
+    second_rng._require_counter_blocks(n_blocks - n_first_blocks)
     grid = (triton.cdiv(n_blocks, block_size),)
     with torch.cuda.device(first_rng.device):
         _fused_discrete_gaussian_two_streams_kernel[grid](
@@ -1122,17 +1228,23 @@ def stochastic_round(
 ) -> torch.Tensor:
     """Randomly round floating values to int64."""
 
-    if not values.is_cuda:
-        raise ValueError("values must be a CUDA tensor")
     if values.device != rng.device:
         raise ValueError("values must be on the same device as rng")
     values = values.contiguous()
     n_values = values.numel()
     if n_values == 0:
         return torch.empty_like(values, dtype=torch.int64)
+    if rng.device.type == "cpu":
+        words = rng.uint32(n_values).to(torch.int64).reshape(values.shape)
+        absolute = values.abs()
+        base = torch.floor(absolute)
+        threshold = ((absolute - base) * 4294967296.0).to(torch.int64)
+        rounded = base.to(torch.int64) + (words < threshold).to(torch.int64)
+        return torch.where(values < 0, -rounded, rounded)
     out = torch.empty((n_values,), dtype=torch.int64, device=rng.device)
     if _can_use_fused(rng, required_words=n_values):
         n_blocks = n_values // 16
+        rng._require_counter_blocks(n_blocks)
         grid = (triton.cdiv(n_blocks, block_size),)
         with torch.cuda.device(rng.device):
             _fused_stochastic_round_kernel[grid](

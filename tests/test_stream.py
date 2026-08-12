@@ -39,3 +39,34 @@ def test_stream_bytes_shape_and_state_roundtrip():
 
     restored = ChaCha20Rng.from_state_dict(rng.state_dict())
     assert torch.equal(rng.bytes(70), restored.bytes(70))
+
+
+def test_cpu_stream_matches_cuda_stream_when_available():
+    key = list(range(8))
+    nonce = [100, 200]
+    cpu = ChaCha20Rng(key=key, nonce=nonce, counter=9, device="cpu")
+    expected = cpu.uint32((3, 7))
+    if torch.cuda.is_available():
+        cuda = ChaCha20Rng(key=key, nonce=nonce, counter=9, device="cuda:0")
+        assert torch.equal(expected, cuda.uint32((3, 7)).cpu())
+
+
+def test_cpu_stream_chunking_and_state_roundtrip():
+    key = list(range(8))
+    nonce = [5, 6]
+    one_shot = ChaCha20Rng(key=key, nonce=nonce, device="cpu")
+    chunked = ChaCha20Rng(key=key, nonce=nonce, device="cpu")
+    expected = one_shot.uint32(40)
+    got = torch.cat([chunked.uint32(17), chunked.uint32(23)])
+    assert torch.equal(got, expected)
+    restored = ChaCha20Rng.from_state_dict(chunked.state_dict())
+    assert torch.equal(chunked.bytes(70), restored.bytes(70))
+
+
+def test_stream_rejects_counter_wraparound():
+    with pytest.raises(ValueError, match="unsigned 64-bit"):
+        ChaCha20Rng(counter=-1, device="cpu")
+    rng = ChaCha20Rng(counter=(1 << 64) - 1, device="cpu")
+    assert rng.blocks(1).shape == (1, 16)
+    with pytest.raises(OverflowError, match="counter space"):
+        rng.blocks(1)
