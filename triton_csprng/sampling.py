@@ -6,9 +6,8 @@ from collections.abc import Sequence
 
 import mpmath as mpm
 import torch
-import triton
-import triton.language as tl
 
+from ._triton import require_triton, tl, triton
 from .stream import ChaCha20Rng
 
 
@@ -914,6 +913,7 @@ def bounded_uint64(
         out_shape = _as_shape(shape)
     if rng.device.type == "cpu":
         return _cpu_bounded_uint64(rng, bound_values, out_shape)
+    require_triton()
     bound_t = _cached_bounds_tensor(bound_values, str(rng.device))
     n_values = _numel(out_shape)
     if n_values == 0:
@@ -1000,6 +1000,7 @@ def bounded_uint64_two_streams(
             (out_shape[0] - first_channels, values_per_channel),
         )
         return torch.cat((first, second), dim=0).reshape(out_shape)
+    require_triton()
     if first_rng._pending_bytes.numel() or second_rng._pending_bytes.numel():
         raise ValueError("two-stream fused sampling requires aligned streams")
     values_per_bound = n_values // out_shape[0]
@@ -1109,6 +1110,7 @@ def discrete_gaussian(
         return torch.empty(out_shape, dtype=torch.int64, device=rng.device)
     if rng.device.type == "cpu":
         return _cpu_discrete_gaussian(rng, out_shape, float(sigma))
+    require_triton()
     threshold_low_t, threshold_high_t, tree_depth = _device_cdt_thresholds(
         float(sigma), str(rng.device)
     )
@@ -1184,6 +1186,7 @@ def discrete_gaussian_two_streams(
             float(sigma),
         )
         return torch.cat((first, second), dim=0).reshape(out_shape)
+    require_triton()
     if first_rng._pending_bytes.numel() or second_rng._pending_bytes.numel():
         raise ValueError("two-stream fused sampling requires aligned streams")
     values_per_channel = n_values // out_shape[0]
@@ -1241,6 +1244,7 @@ def stochastic_round(
         threshold = ((absolute - base) * 4294967296.0).to(torch.int64)
         rounded = base.to(torch.int64) + (words < threshold).to(torch.int64)
         return torch.where(values < 0, -rounded, rounded)
+    require_triton()
     out = torch.empty((n_values,), dtype=torch.int64, device=rng.device)
     if _can_use_fused(rng, required_words=n_values):
         n_blocks = n_values // 16

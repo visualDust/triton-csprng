@@ -38,10 +38,10 @@ cd triton-csprng
 python -m pip install -e ".[dev]"
 ```
 
-Runtime dependencies are PyTorch, Triton, and `mpmath` for high-precision CDT
-construction. CPU execution uses PyTorch tensor operations and the same
-ChaCha20 stream and sampling mappings as CUDA. In CUDA environments, install
-the PyTorch/Triton build that matches the target CUDA stack first.
+Runtime dependencies are PyTorch and `mpmath` for high-precision CDT
+construction. CPU execution does not require Triton. CUDA execution additionally
+requires Triton; install `triton-csprng[cuda]` after installing the PyTorch build
+that matches the target CUDA stack.
 
 ## Quick start
 

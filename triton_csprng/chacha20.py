@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import torch
-import triton
-import triton.language as tl
+
+from ._triton import require_triton, tl, triton
 
 _CHACHA20_CONST = (0x61707865, 0x3320646E, 0x79622D32, 0x6B206574)
 _MASK32 = 0xFFFFFFFF
@@ -243,6 +243,7 @@ def chacha20_blocks(
             ],
             dim=1,
         )
+    require_triton()
     out = torch.empty_like(states)
     n_blocks = states.shape[0]
     grid = (triton.cdiv(n_blocks, block_size),)
