@@ -835,20 +835,15 @@ def _sampling_num_warps(block_size: int) -> int:
     return max(1, min(8, int(block_size) // 32))
 
 
-def _cpu_uint128_words(rng: ChaCha20Rng, n_values: int) -> list[list[int]]:
-    return rng.uint32(n_values * 4).reshape(-1, 4).tolist()
-
-
 def _cpu_sample_words(
     rng: ChaCha20Rng, n_values: int
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return ``(U_lo, U_hi)`` uint64 halves of the ChaCha20 128-bit words.
 
-    The stream consumption is identical to :func:`_cpu_uint128_words`:
-    ``n_values * 4`` uint32 words from the same counter stream. The two
-    returned arrays keep the exact 128-bit word values as uint64 halves so
-    downstream sampling can stay vectorized instead of materializing Python
-    ints.
+    The stream consumption matches the previous CPU sampling path exactly:
+    ``n_values * 4`` uint32 words from the same counter stream. The returned
+    arrays retain the exact word values as uint64 halves so downstream
+    sampling does not materialize Python integers.
     """
 
     words = rng.uint32(n_values * 4).reshape(-1, 4)
@@ -861,23 +856,22 @@ def _cpu_sample_words(
 def _mulhi64(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Return the high 64 bits of the unsigned 128-bit product ``a * b``.
 
-    NumPy unsigned integer arithmetic wraps modulo 2**64 by definition, and
-    the split-word identity below is exact for every 64-bit input pair:
-
-    ``a*b = a1*b1*2**64 + (a0*b1 + a1*b0)*2**32 + a0*b0`` with
-    ``a = a1*2**32 + a0``, so the high 64 bits are
-    ``a1*b1 + floor((a0*b1 + a1*b0)/2**32)`` where the wrapped 64-bit sum
-    ``t = (a0*b1 + a1*b0) mod 2**64`` contributes ``t >> 32`` plus the
-    ``2**32`` carry that escaped the wrap.
+    Split each input into 32-bit limbs. Every intermediate below fits in
+    uint64, including the carry from the high half of the low-limb product.
     """
 
-    a0 = a & np.uint64(0xFFFFFFFF)
-    a1 = a >> np.uint64(32)
-    b0 = b & np.uint64(0xFFFFFFFF)
-    b1 = b >> np.uint64(32)
-    t = a0 * b1 + a1 * b0  # wraps mod 2**64 by numpy's unsigned semantics
-    carry = (t < a0 * b1).astype(np.uint64)
-    return a1 * b1 + (t >> np.uint64(32)) + (carry << np.uint64(32))
+    mask32 = np.uint64(0xFFFFFFFF)
+    shift = np.uint64(32)
+    a0 = a & mask32
+    a1 = a >> shift
+    b0 = b & mask32
+    b1 = b >> shift
+    w0 = a0 * b0
+    t = a1 * b0 + (w0 >> shift)
+    w1 = t & mask32
+    w2 = t >> shift
+    w1 = a0 * b1 + w1
+    return a1 * b1 + w2 + (w1 >> shift)
 
 
 def _cpu_bounded_uint64(
@@ -933,12 +927,12 @@ def _cpu_discrete_gaussian(
         for _ in range(depth):
             index = magnitude + np.uint64(step - 1)
             ge = (high > threshold_high[index]) | (
-                (high == threshold_high[index])
-                & (low >= threshold_low[index])
+                (high == threshold_high[index]) & (low >= threshold_low[index])
             )
             magnitude = magnitude + np.uint64(step) * ge.astype(np.uint64)
             step //= 2
-    signed = np.where(sign.astype(bool), magnitude.astype(np.int64), -(magnitude.astype(np.int64)))
+    signed_magnitude = magnitude.astype(np.int64)
+    signed = np.where(sign.astype(bool), signed_magnitude, -signed_magnitude)
     return torch.from_numpy(signed.astype(np.int64)).reshape(out_shape)
 
 

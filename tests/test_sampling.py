@@ -1,3 +1,6 @@
+import random
+
+import numpy as np
 import pytest
 import torch
 
@@ -11,6 +14,7 @@ from triton_csprng.sampling import (
     _cached_bounds_tensor,
     _device_cdt_thresholds,
     _half_plane_cdt_threshold_words,
+    _mulhi64,
     bounded_uint64_two_streams,
     discrete_gaussian_two_streams,
 )
@@ -25,6 +29,105 @@ def _bounded_multiply_high_cpu(words, bounds):
         u128 = x_low | (x_high << 64)
         out.append((int(bound) * u128) >> 128)
     return torch.tensor(out, dtype=torch.int64)
+
+
+def test_cpu_mulhi64_matches_python_integer_products():
+    edges = [
+        0,
+        1,
+        2,
+        3,
+        (1 << 32) - 1,
+        1 << 32,
+        (1 << 32) + 1,
+        (1 << 63) - 1,
+        1 << 63,
+        (1 << 64) - 1,
+    ]
+    pairs = [(a, b) for a in edges for b in edges]
+    generator = random.Random(20260814)
+    pairs.extend(
+        (generator.getrandbits(64), generator.getrandbits(64))
+        for _ in range(10_000)
+    )
+    lhs = np.asarray([a for a, _ in pairs], dtype=np.uint64)
+    rhs = np.asarray([b for _, b in pairs], dtype=np.uint64)
+    expected = np.asarray([(a * b) >> 64 for a, b in pairs], dtype=np.uint64)
+    assert np.array_equal(_mulhi64(lhs, rhs), expected)
+
+
+def test_cpu_bounded_uint64_matches_python_reference_for_wide_bounds():
+    key = list(range(8))
+    nonce = [101, 202]
+    bounds = [
+        3,
+        17,
+        (1 << 31) - 1,
+        (1 << 32) - 1,
+        (1 << 60) + 93,
+        (1 << 63) - 1,
+    ]
+    values_per_bound = 1025
+    shape = (len(bounds), values_per_bound)
+    repeated_bounds = [
+        bound for bound in bounds for _ in range(values_per_bound)
+    ]
+
+    reference_rng = ChaCha20Rng(key=key, nonce=nonce, device="cpu")
+    words = reference_rng.uint32(len(repeated_bounds) * 4)
+    expected = _bounded_multiply_high_cpu(words, repeated_bounds).reshape(shape)
+
+    sampled_rng = ChaCha20Rng(key=key, nonce=nonce, device="cpu")
+    actual = bounded_uint64(sampled_rng, bounds, shape)
+    assert torch.equal(actual, expected)
+    assert sampled_rng.counter == reference_rng.counter
+    assert torch.equal(
+        sampled_rng.state_dict()["pending_bytes"],
+        reference_rng.state_dict()["pending_bytes"],
+    )
+    if torch.cuda.is_available():
+        cuda_rng = ChaCha20Rng(key=key, nonce=nonce, device="cuda:0")
+        cuda_actual = bounded_uint64(cuda_rng, bounds, shape).cpu()
+        assert torch.equal(cuda_actual, expected)
+
+
+@pytest.mark.parametrize("sigma", [0.15, 0.5, 3.2, 8.0])
+def test_cpu_discrete_gaussian_matches_python_reference(sigma: float):
+    key = list(range(8))
+    nonce = [303, 404]
+    sample_count = 1025
+    lows, highs, depth = _half_plane_cdt_threshold_words(sigma)
+    thresholds = [
+        (int(high) << 64) | int(low)
+        for low, high in zip(lows, highs, strict=True)
+    ]
+
+    reference_rng = ChaCha20Rng(key=key, nonce=nonce, device="cpu")
+    words = reference_rng.uint32(sample_count * 4).reshape(-1, 4).tolist()
+    expected: list[int] = []
+    for row in words:
+        low = (int(row[0]) << 32) | int(row[1])
+        high_with_sign = (int(row[2]) << 32) | int(row[3])
+        sign = high_with_sign & 1
+        high = high_with_sign >> 1
+        random_value = (high << 64) | low
+        magnitude = 0
+        if depth > 0:
+            step = 1 << (depth - 1)
+            for _ in range(depth):
+                if random_value >= thresholds[magnitude + step - 1]:
+                    magnitude += step
+                step //= 2
+        expected.append(magnitude if sign else -magnitude)
+
+    sampled_rng = ChaCha20Rng(key=key, nonce=nonce, device="cpu")
+    actual = discrete_gaussian(sampled_rng, (sample_count,), sigma=sigma)
+    assert actual.tolist() == expected
+    assert sampled_rng.counter == reference_rng.counter
+    assert torch.equal(
+        sampled_rng.state_dict()["pending_bytes"],
+        reference_rng.state_dict()["pending_bytes"],
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
