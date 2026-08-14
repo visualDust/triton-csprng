@@ -7,6 +7,8 @@ from collections.abc import Sequence
 import mpmath as mpm
 import torch
 
+import numpy as np
+
 from ._triton import require_triton, tl, triton
 from .stream import ChaCha20Rng
 
@@ -833,8 +835,43 @@ def _sampling_num_warps(block_size: int) -> int:
     return max(1, min(8, int(block_size) // 32))
 
 
-def _cpu_uint128_words(rng: ChaCha20Rng, n_values: int) -> list[list[int]]:
-    return rng.uint32(n_values * 4).reshape(-1, 4).tolist()
+def _cpu_sample_words(
+    rng: ChaCha20Rng, n_values: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(U_lo, U_hi)`` uint64 halves of the ChaCha20 128-bit words.
+
+    The stream consumption matches the previous CPU sampling path exactly:
+    ``n_values * 4`` uint32 words from the same counter stream. The returned
+    arrays retain the exact word values as uint64 halves so downstream
+    sampling does not materialize Python integers.
+    """
+
+    words = rng.uint32(n_values * 4).reshape(-1, 4)
+    view = words.numpy().astype(np.uint64)
+    low = (view[:, 0] << np.uint64(32)) | view[:, 1]
+    high = (view[:, 2] << np.uint64(32)) | view[:, 3]
+    return low, high
+
+
+def _mulhi64(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Return the high 64 bits of the unsigned 128-bit product ``a * b``.
+
+    Split each input into 32-bit limbs. Every intermediate below fits in
+    uint64, including the carry from the high half of the low-limb product.
+    """
+
+    mask32 = np.uint64(0xFFFFFFFF)
+    shift = np.uint64(32)
+    a0 = a & mask32
+    a1 = a >> shift
+    b0 = b & mask32
+    b1 = b >> shift
+    w0 = a0 * b0
+    t = a1 * b0 + (w0 >> shift)
+    w1 = t & mask32
+    w2 = t >> shift
+    w1 = a0 * b1 + w1
+    return a1 * b1 + w2 + (w1 >> shift)
 
 
 def _cpu_bounded_uint64(
@@ -848,15 +885,19 @@ def _cpu_bounded_uint64(
     if n_values % len(bounds) != 0:
         raise ValueError("output size must be divisible by number of bounds")
     values_per_bound = n_values // len(bounds)
-    words = _cpu_uint128_words(rng, n_values)
-    samples = []
-    for index, row in enumerate(words):
-        low = (int(row[0]) << 32) | int(row[1])
-        high = (int(row[2]) << 32) | int(row[3])
-        random_value = low | (high << 64)
-        bound = int(bounds[index // values_per_bound])
-        samples.append((bound * random_value) >> 128)
-    return torch.tensor(samples, dtype=torch.int64).reshape(out_shape)
+    low, high = _cpu_sample_words(rng, n_values)
+    bound = np.asarray(bounds, dtype=np.uint64).repeat(values_per_bound)
+    # floor(bound*U / 2**128) for U = high*2**64 + low:
+    #   bound*U = bound*high*2**64 + bound*low
+    #           = X_hi*2**128 + X_lo*2**64 + M_hi*2**64 + M_lo
+    # so the result is X_hi + carry where carry is the overflow of
+    # X_lo + M_hi into bit 64.
+    x_hi = _mulhi64(bound, high)
+    x_lo = bound * high  # wraps mod 2**64
+    m_hi = _mulhi64(bound, low)
+    wrapped = x_lo + m_hi  # wraps mod 2**64
+    carry = (wrapped < x_lo).astype(np.uint64)
+    return torch.from_numpy((x_hi + carry).astype(np.int64)).reshape(out_shape)
 
 
 def _cpu_discrete_gaussian(
@@ -870,23 +911,29 @@ def _cpu_discrete_gaussian(
         (int(high) << 64) | int(low)
         for low, high in zip(lows, highs, strict=True)
     ]
-    samples: list[int] = []
-    for row in _cpu_uint128_words(rng, n_values):
-        low = (int(row[0]) << 32) | int(row[1])
-        high_with_sign = (int(row[2]) << 32) | int(row[3])
-        sign = high_with_sign & 1
-        high = high_with_sign >> 1
-        random_value = (high << 64) | low
-        magnitude = 0
-        if depth > 0:
-            step = 1 << (depth - 1)
-            for _ in range(depth):
-                threshold_index = magnitude + step - 1
-                if random_value >= thresholds[threshold_index]:
-                    magnitude += step
-                step //= 2
-        samples.append(magnitude if sign else -magnitude)
-    return torch.tensor(samples, dtype=torch.int64).reshape(out_shape)
+    low, high_with_sign = _cpu_sample_words(rng, n_values)
+    sign = high_with_sign & np.uint64(1)
+    high = high_with_sign >> np.uint64(1)
+    magnitude = np.zeros(n_values, dtype=np.uint64)
+    if depth > 0:
+        threshold_high = np.asarray(
+            [value >> 64 for value in thresholds], dtype=np.uint64
+        )
+        threshold_low = np.asarray(
+            [value & 0xFFFFFFFFFFFFFFFF for value in thresholds],
+            dtype=np.uint64,
+        )
+        step = 1 << (depth - 1)
+        for _ in range(depth):
+            index = magnitude + np.uint64(step - 1)
+            ge = (high > threshold_high[index]) | (
+                (high == threshold_high[index]) & (low >= threshold_low[index])
+            )
+            magnitude = magnitude + np.uint64(step) * ge.astype(np.uint64)
+            step //= 2
+    signed_magnitude = magnitude.astype(np.int64)
+    signed = np.where(sign.astype(bool), signed_magnitude, -signed_magnitude)
+    return torch.from_numpy(signed.astype(np.int64)).reshape(out_shape)
 
 
 def bounded_uint64(
