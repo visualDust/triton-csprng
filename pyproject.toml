@@ -1,6 +1,6 @@
 [project]
 name = "triton-csprng"
-version = "0.1.4"
+version = "0.1.5"
 description = "ChaCha20 CSPRNG and CPU/CUDA sampling primitives for PyTorch/FHE workloads"
 readme = "README.md"
 requires-python = ">=3.10"
